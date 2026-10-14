@@ -1,0 +1,420 @@
+import 'dart:math';
+import 'dart:isolate';
+
+import 'core_bridge.dart';
+import 'models.dart';
+
+String categoryName(String name) {
+  final compact = name.trim().replaceAll(RegExp(r'\s+'), '');
+  return switch (compact) {
+    'AI成人短剧' || 'AI短剧' => 'AI 短剧',
+    'AI成人漫剧' || 'AI漫剧' => 'AI 漫剧',
+    'AI换脸' => 'AI 换脸',
+    'AI魔改' => 'AI 魔改',
+    'AI剧' => 'AI 剧',
+    '' => '未分类',
+    _ => name.trim(),
+  };
+}
+
+class _CatalogChoice {
+  _CatalogChoice(this.category);
+  final CatalogCategory category;
+  final requests = <String, String>{};
+}
+
+class _CatalogEntry {
+  List<Drama> items = [];
+  int page = 0;
+  int nextPage = 1;
+  bool hasMore = true;
+  bool fresh = false;
+}
+
+class _CatalogSession {
+  final entries = <String, _CatalogEntry>{};
+  int generation = 0;
+}
+
+class CatalogBrowser {
+  CatalogBrowser(this.repository);
+  final AppRepository repository;
+  final _menus = <String, List<CatalogCategory>>{};
+  final _library = <String, Map<String, Drama>>{};
+  final _sessions = <String, _CatalogSession>{};
+  final _choiceCache = <String, List<_CatalogChoice>>{};
+  final _localCategories = <String, List<String>>{};
+  int _generation = 0;
+
+  Future<void> cancel() {
+    _generation++;
+    for (final session in _sessions.values) {
+      session.generation++;
+    }
+    return repository.cancelCatalog();
+  }
+
+  Future<void> _remember(String source, Iterable<Drama> items) async {
+    final generation = _generation;
+    final library = Map<String, Drama>.of(_library[source] ?? {});
+    var changed = false;
+    var processed = 0;
+    for (final drama in items) {
+      if (++processed % 256 == 0) {
+        await Future<void>.delayed(Duration.zero);
+        if (generation != _generation) return;
+      }
+      if (drama.source != source) continue;
+      final previous = library[drama.id];
+      final updated = previous?.merge(drama) ?? drama;
+      if (previous != null && previous.sameAs(updated)) continue;
+      library[drama.id] = updated;
+      changed = true;
+    }
+    if (generation != _generation) return;
+    _library[source] = library;
+    while (_library.length > 4) {
+      _library.remove(_library.keys.first);
+    }
+    if (library.length > 20000) _library.remove(source);
+    if (changed) _choiceCache.clear();
+  }
+
+  void updateDrama(Drama drama) {
+    updateDramas([drama]);
+  }
+
+  void updateDramas(Iterable<Drama> dramas) {
+    final updates = {for (final drama in dramas) drama.id: drama};
+    if (updates.isEmpty) return;
+    for (final drama in updates.values) {
+      final library = _library[drama.source];
+      if (library?.containsKey(drama.id) == true) {
+        final previous = library![drama.id]!;
+        final updated = previous.merge(drama);
+        if (previous.category != updated.category) _choiceCache.clear();
+        if (!previous.sameAs(updated)) library[drama.id] = updated;
+      }
+    }
+    for (final session in _sessions.values) {
+      for (final entry in session.entries.values) {
+        List<Drama>? updatedItems;
+        for (var index = 0; index < entry.items.length; index++) {
+          final item = entry.items[index];
+          final fresh = updates[item.id];
+          if (fresh == null) continue;
+          final updated = item.merge(fresh);
+          if (item.sameAs(updated)) continue;
+          updatedItems ??= List<Drama>.of(entry.items);
+          updatedItems[index] = updated;
+        }
+        if (updatedItems != null) entry.items = updatedItems;
+      }
+    }
+  }
+
+  Future<void> _each<T>(List<T> entries, Future<void> Function(T) visit) async {
+    var index = 0;
+    Future<void> worker() async {
+      while (index < entries.length) {
+        final entry = entries[index++];
+        await visit(entry);
+      }
+    }
+
+    await Future.wait(List.generate(min(2, entries.length), (_) => worker()));
+  }
+
+  Future<String?> loadCategories(
+    SourceGroup group, {
+    bool force = false,
+    bool cacheOnly = false,
+  }) async {
+    final failures = <String>[];
+    await _each(group.sources, (source) async {
+      try {
+        final summary = await repository.catalogSummary(source.id);
+        _localCategories[source.id] = summary.categories;
+        _choiceCache.clear();
+      } catch (_) {}
+      if (cacheOnly) return;
+      try {
+        _menus[source.id] = await repository.categories(
+          source.id,
+          force: force,
+        );
+        _choiceCache.clear();
+      } catch (_) {
+        failures.add(source.groupName);
+      }
+    });
+    return failures.isEmpty ? null : '部分分类暂未加载，点击重试';
+  }
+
+  List<_CatalogChoice> _choices(SourceGroup group) => _choiceCache.putIfAbsent(
+    group.sources.map((source) => source.id).join('|'),
+    () => _buildChoices(group),
+  );
+
+  List<_CatalogChoice> _buildChoices(SourceGroup group) {
+    final choices = <String, _CatalogChoice>{};
+    for (final source in group.sources) {
+      for (final category in _menus[source.id] ?? const <CatalogCategory>[]) {
+        if (category.id.isEmpty) continue;
+        final name = categoryName(category.name);
+        final choice = choices.putIfAbsent(
+          name,
+          () => _CatalogChoice(CatalogCategory('category:$name', name)),
+        );
+        choice.requests[source.id] = category.id;
+      }
+    }
+    final names = {
+      for (final source in group.sources)
+        ...?_localCategories[source.id]?.map(categoryName),
+      for (final source in group.sources)
+        for (final item in _library[source.id]?.values ?? const <Drama>[])
+          categoryName(item.category),
+    }.toList()..sort();
+    for (final name in names) {
+      choices.putIfAbsent(
+        name,
+        () => _CatalogChoice(CatalogCategory('local:$name', name, local: true)),
+      );
+    }
+    return choices.values.toList();
+  }
+
+  List<CatalogCategory> categories(SourceGroup group) => [
+    CatalogCategory.all,
+    for (final choice in _choices(group)) choice.category,
+  ];
+
+  _CatalogChoice? _choice(SourceGroup group, String category) => _choices(
+    group,
+  ).where((choice) => choice.category.id == category).firstOrNull;
+
+  Future<CatalogPage> load(
+    SourceGroup group, {
+    String category = '',
+    String query = '',
+    bool more = false,
+    bool force = false,
+    bool useCache = false,
+    bool cacheOnly = false,
+    void Function(CatalogPage)? onCached,
+    void Function(CatalogPage)? onPartial,
+  }) async {
+    if (cacheOnly && (more || force || query.trim().isNotEmpty)) {
+      throw AppFailure('缓存读取不能同时请求搜索或续页');
+    }
+    final request = ++_generation;
+    for (final session in _sessions.values) {
+      session.generation++;
+    }
+    await repository.cancelCatalog();
+    if (request != _generation) throw AppFailure('已取消加载');
+    final choice = query.isEmpty ? _choice(group, category) : null;
+    final requests = choice != null && !choice.category.local
+        ? choice.requests
+        : {for (final source in group.sources) source.id: ''};
+    final key =
+        '${group.sources.map((s) => s.id).join(',')}|'
+        '${choice?.category.local == false ? category : ''}|$query';
+    final session = _sessions.remove(key) ?? _CatalogSession();
+    _sessions[key] = session;
+    while (_sessions.length > 4) {
+      _sessions.remove(_sessions.keys.first);
+    }
+    final generation = ++session.generation;
+    final failures = <String, String>{};
+    final sourceOrder = requests.keys.toList();
+    for (final source in sourceOrder) {
+      session.entries.putIfAbsent(source, _CatalogEntry.new);
+    }
+
+    final localRows = <List<Drama>>[];
+    if (choice?.category.local == true) {
+      await _each(group.sources, (source) async {
+        try {
+          final cached = await repository.cached(source.id);
+          if (generation != session.generation) return;
+          localRows.add(cached.items);
+        } catch (error) {
+          failures[source.id] = error.toString();
+        }
+      });
+    }
+    Future<CatalogPage> snapshot() async {
+      final rows = sourceOrder
+          .map((source) => session.entries[source]!.items)
+          .toList();
+      final extra = localRows;
+      final count =
+          rows.fold<int>(0, (count, row) => count + row.length) +
+          extra.fold<int>(0, (count, row) => count + row.length);
+      final local = choice?.category.local ?? false;
+      final categoryNameFilter = choice?.category.name;
+      final items = count >= 2000
+          ? await _mergeCatalogInBackground(
+              rows,
+              extra,
+              local,
+              categoryNameFilter,
+            )
+          : _mergeCatalogRows(rows, extra, local, categoryNameFilter);
+      return CatalogPage(
+        items,
+        hasMore: sourceOrder.any((source) => session.entries[source]!.hasMore),
+        page: sourceOrder.fold<int>(
+          1,
+          (page, source) => max(page, session.entries[source]!.page),
+        ),
+        fresh: sourceOrder.every((source) => session.entries[source]!.fresh),
+        warning: failures.values.toSet().join('；'),
+      );
+    }
+
+    var emitted = 0;
+    var lastEmit = DateTime.fromMillisecondsSinceEpoch(0);
+    Future<void> emitPartial() async {
+      final listener = onPartial;
+      if (listener == null || cacheOnly || more) return;
+      if (generation != session.generation) return;
+      final now = DateTime.now();
+      if (now.difference(lastEmit) < const Duration(milliseconds: 250)) {
+        return;
+      }
+      final page = await snapshot();
+      if (generation != session.generation) return;
+      if (page.items.length == emitted) return;
+      lastEmit = now;
+      emitted = page.items.length;
+      listener(page);
+    }
+
+    if ((useCache || cacheOnly) && !force && !more && query.isEmpty) {
+      await _each(sourceOrder, (source) async {
+        try {
+          final cached = await repository.cached(
+            source,
+            category: requests[source]!,
+          );
+          if (generation != session.generation || cached.items.isEmpty) return;
+          final entry = session.entries[source]!;
+          entry.items = cached.items;
+          entry.page = cached.page;
+          entry.nextPage = cached.page + 1;
+          entry.hasMore = cached.hasMore || cached.warning.isNotEmpty;
+          entry.fresh = cached.fresh && cached.warning.isEmpty;
+          if (cached.warning.isNotEmpty) failures[source] = cached.warning;
+          await _remember(source, cached.items);
+        } catch (error) {
+          if (cacheOnly) failures[source] = error.toString();
+        }
+      });
+      if (generation != session.generation) return await snapshot();
+      final cached = await snapshot();
+      if (generation != session.generation) return cached;
+      if (cached.items.isNotEmpty) onCached?.call(cached);
+      if (cacheOnly) return cached;
+      if (cached.fresh && cached.items.isNotEmpty) return cached;
+    }
+
+    await _each(sourceOrder, (source) async {
+      if (generation != session.generation) return;
+      final entry = session.entries[source]!;
+      if (more && !entry.hasMore) return;
+      if (useCache && !force && !more && entry.fresh) return;
+      final page = more ? entry.nextPage : 1;
+      try {
+        final result = await repository.catalog(
+          source,
+          category: requests[source]!,
+          query: query,
+          page: page,
+          force: force,
+        );
+        if (generation != session.generation) return;
+        final items = <String, Drama>{
+          if (more)
+            for (final item in entry.items) item.id: item,
+          for (final item in result.items) item.id: item,
+        };
+        entry.items = items.values.toList();
+        entry.page = result.page;
+        // hasMore 为真说明后面还有内容，必须推进页码；否则带警示时会反复
+        // 请求同一页，分页搜索的「加载更多」就会一直原地打转。
+        entry.nextPage = result.hasMore || result.warning.isEmpty
+            ? result.page + 1
+            : page;
+        entry.hasMore =
+            (query.isEmpty || SourceSite.byId(source).pagedSearch) &&
+            (result.hasMore || result.warning.isNotEmpty);
+        entry.fresh = result.fresh && result.warning.isEmpty;
+        if (query.isEmpty) await _remember(source, result.items);
+        if (generation != session.generation) return;
+        if (result.warning.isNotEmpty) {
+          failures[source] = result.warning;
+        } else {
+          failures.remove(source);
+        }
+      } catch (error) {
+        if (generation != session.generation) return;
+        entry.nextPage = page;
+        entry.hasMore = query.isEmpty || SourceSite.byId(source).pagedSearch;
+        entry.fresh = false;
+        failures[source] = error.toString();
+      }
+      await emitPartial();
+    });
+    final result = await snapshot();
+    if (generation != session.generation) return result;
+    final retainedRows = _sessions.values.fold<int>(
+      0,
+      (count, session) =>
+          count +
+          session.entries.values.fold<int>(
+            0,
+            (count, entry) => count + entry.items.length,
+          ),
+    );
+    if (retainedRows > 40000) {
+      _sessions.removeWhere((sessionKey, _) => sessionKey != key);
+    }
+    if (result.items.isEmpty && failures.isNotEmpty) {
+      throw AppFailure(result.warning);
+    }
+    return result;
+  }
+}
+
+List<Drama> _mergeCatalogRows(
+  List<List<Drama>> rows,
+  List<List<Drama>> extra,
+  bool local,
+  String? category,
+) {
+  final items = <String, Drama>{};
+  final count = rows.fold<int>(0, (count, row) => max(count, row.length));
+  for (var index = 0; index < count; index++) {
+    for (final row in rows) {
+      if (index < row.length) items[row[index].id] = row[index];
+    }
+  }
+  for (final row in extra) {
+    for (final item in row) {
+      if (local || categoryName(item.category) == category) {
+        items.putIfAbsent(item.id, () => item);
+      }
+    }
+  }
+  return items.values.toList();
+}
+
+Future<List<Drama>> _mergeCatalogInBackground(
+  List<List<Drama>> rows,
+  List<List<Drama>> extra,
+  bool local,
+  String? category,
+) => Isolate.run(() => _mergeCatalogRows(rows, extra, local, category));

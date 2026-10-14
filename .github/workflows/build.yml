@@ -1,0 +1,296 @@
+name: Build app packages
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      strict_tests:
+        description: Fail the checks job when tests fail
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+        default: 'false'
+      build_ios:
+        description: Build unsigned iOS packages
+        type: boolean
+        default: false
+      android_zip:
+        description: Wrap Android APK and checksums in the legacy ZIP artifact
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOPROXY: https://proxy.golang.org,direct
+  GOSUMDB: sum.golang.org
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.4'
+          channel: stable
+          cache: true
+      - run: flutter pub get --enforce-lockfile
+      - run: dart format --language-version 3.12 --output=none --set-exit-if-changed lib test integration_test test_driver
+      - run: dart analyze lib test integration_test test_driver
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: flutter test --dart-define=DISABLE_REMOTE_IMAGES=true
+        continue-on-error: ${{ github.event.inputs.strict_tests != 'true' }}
+      - run: flutter test --dart-define=DISABLE_REMOTE_IMAGES=true --dart-define=ALL_SOURCES=true
+        continue-on-error: ${{ github.event.inputs.strict_tests != 'true' }}
+      - run: go test -race ./...
+        working-directory: native
+        continue-on-error: ${{ github.event.inputs.strict_tests != 'true' }}
+      - run: go test -race -ldflags="-X duanjuapp/native/core.buildAllSources=true" ./...
+        working-directory: native
+        continue-on-error: ${{ github.event.inputs.strict_tests != 'true' }}
+
+  android:
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - edition: lvguojian
+            arguments: ''
+          - edition: zhenguojian
+            arguments: '--all-sources'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.4'
+          channel: stable
+          cache: true
+      - name: Install Android NDK
+        run: |
+          # GitHub 托管运行器预装 Android SDK 和若干 NDK 版本，但新版镜像不再把
+          # sdkmanager 加入 PATH，SDK 目录也不固定。先定位 SDK 目录并补装
+          # cmdline-tools，再准备项目所需 NDK 版本。
+          for sdk in "$ANDROID_HOME" "$ANDROID_SDK_ROOT" "/usr/local/lib/android/sdk" "$HOME/Android/Sdk"; do
+            if [ -n "$sdk" ] && [ -d "$sdk" ]; then
+              echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+              echo "ANDROID_SDK_ROOT=$sdk" >> "$GITHUB_ENV"
+              echo "using Android SDK at $sdk"
+              SDK_DIR="$sdk"
+              break
+            fi
+          done
+          : "${SDK_DIR:?无法定位 Android SDK 目录}"
+          # 记录版本目录下的所有 ndkVersion，供 build.gradle.kts 选择可用版本。
+          # 这样即使远端 NDK 下载失败，也能用运行器自带版本完成构建。
+          NDK_VERSIONS="$(find "$SDK_DIR/ndk" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | sort -V | tr '\n' ' ')"
+          echo "ANDROID_NDK_VERSIONS=$NDK_VERSIONS" >> "$GITHUB_ENV"
+          echo "运行器已有 NDK 版本：${NDK_VERSIONS:-无}"
+          # 优先使用已安装的 sdkmanager（可能位于 latest 或版本化目录）。
+          SDKMGR=$(find "$SDK_DIR/cmdline-tools" -maxdepth 3 -name sdkmanager -type f 2>/dev/null | head -n1)
+          if [ -z "$SDKMGR" ]; then
+            echo "未找到 sdkmanager，正在安装 cmdline-tools..."
+            CMDLINE_DIR="$SDK_DIR/cmdline-tools"
+            mkdir -p "$CMDLINE_DIR"
+            # 下载指定版本的 Android 命令行工具（Linux 版）。
+            curl -sSL -o /tmp/cmdline-tools.zip \
+              "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+            unzip -q -o /tmp/cmdline-tools.zip -d "$CMDLINE_DIR"
+            mkdir -p "$CMDLINE_DIR/latest"
+            mv -f "$CMDLINE_DIR/cmdline-tools/"* "$CMDLINE_DIR/latest/" 2>/dev/null || true
+            rmdir "$CMDLINE_DIR/cmdline-tools" 2>/dev/null || true
+            SDKMGR="$CMDLINE_DIR/latest/bin/sdkmanager"
+          fi
+          SDKMGR_DIR=$(dirname "$SDKMGR")
+          echo "$SDKMGR_DIR" >> "$GITHUB_PATH"
+          export PATH="$SDKMGR_DIR:$PATH"
+          # 关闭 pipefail，避免 `yes |` 因 SIGPIPE 被误判为失败。
+          set +o pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          set -o pipefail
+          # 目标 NDK 已存在时直接复用；缺失时才下载。
+          TARGET_NDK="$SDK_DIR/ndk/28.2.13676358"
+          if [ -d "$TARGET_NDK" ]; then
+            echo "NDK 28.2.13676358 已存在，跳过下载。"
+          else
+            set +o pipefail
+            yes | sdkmanager "ndk;28.2.13676358" || true
+            set -o pipefail
+          fi
+          # 汇总实际可用的 NDK，写入供 Gradle 使用。
+          NDK_VERSIONS="$(find "$SDK_DIR/ndk" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | sort -V | tr '\n' ' ')"
+          echo "ANDROID_NDK_VERSIONS=$NDK_VERSIONS" >> "$GITHUB_ENV"
+          # 远端 NDK 下载可能被截断（sdkmanager 报 unknown archive）。此时不要
+          # 让步骤失败，改用运行器预装的其它 NDK 版本继续构建，避免整个任务中断。
+          if [ -z "$NDK_VERSIONS" ]; then
+            echo "::error::Android SDK 中没有可用的 NDK，无法继续构建。"
+            exit 1
+          fi
+          PREFERRED="28.2.13676358"
+          case " $NDK_VERSIONS " in
+            *" $PREFERRED "*) ;;
+            *) PREFERRED="$(echo "$NDK_VERSIONS" | tr ' ' '\n' | grep -v '^$' | sort -V | tail -n1)" ;;
+          esac
+          echo "ANDROID_NDK_HOME=$SDK_DIR/ndk/$PREFERRED" >> "$GITHUB_ENV"
+          echo "构建将使用 NDK $PREFERRED（可用：$NDK_VERSIONS）"
+      - name: Configure Gradle repositories
+        run: |
+          mkdir -p "$HOME/.gradle/init.d"
+          cat > "$HOME/.gradle/init.d/guoapp-repositories.gradle" <<'EOF'
+          gradle.beforeSettings { settings ->
+              settings.pluginManagement.repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          gradle.beforeProject { project ->
+              project.buildscript.repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          EOF
+      - name: Configure Android signing
+        run: python scripts/configure_signing.py
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      - run: python scripts/build_android.py --abi arm64-v8a ${{ matrix.arguments }}
+      - name: Remove signing files
+        if: always()
+        run: python scripts/configure_signing.py --clean
+      - name: Upload Android APK directly
+        if: ${{ github.event.inputs.android_zip != 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: dist/android/${{ matrix.edition }}-*-arm64-v8a.apk
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: ${{ github.event.inputs.android_zip == 'true' }}
+        with:
+          name: ${{ matrix.edition }}-android
+          path: dist/android/*
+          if-no-files-found: error
+          retention-days: 14
+  windows:
+    needs: checks
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - edition: lvguojian
+            arguments: ''
+          - edition: zhenguojian
+            arguments: '--all-sources'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.4'
+          channel: stable
+          cache: true
+      - name: Install MinGW-w64
+        run: |
+          # setup-mingw action 会删除 libpthread.dll.a 等旧版导入库，新版
+          # MinGW（UCRT 构建）目录结构不同，导致 Remove-Item 失败。改为直接
+          # 用 chocolatey 安装 MinGW，再定位 x86_64-w64-mingw32-gcc.exe 的 bin
+          # 目录并写入 GITHUB_PATH。
+          choco install mingw --no-progress -y
+          $roots = 'C:\ProgramData\mingw64', 'C:\ProgramData\chocolatey\lib\mingw'
+          $bin = $roots | ForEach-Object { Join-Path $_ 'mingw64\bin' } |
+            Where-Object { Test-Path (Join-Path $_ 'x86_64-w64-mingw32-gcc.exe') } | Select-Object -First 1
+          if (-not $bin) {
+            $found = Get-ChildItem $roots -Recurse -Filter 'x86_64-w64-mingw32-gcc.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $bin = $found.Directory.FullName }
+          }
+          if (-not $bin) { throw '未找到 MinGW-w64 的 x86_64-w64-mingw32-gcc.exe' }
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & (Join-Path $bin 'x86_64-w64-mingw32-gcc.exe') --version
+      - run: python scripts/build_windows.py ${{ matrix.arguments }}
+      - run: choco install ffmpeg --no-progress -y
+      - run: python scripts/smoke_windows.py ${{ matrix.arguments }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.edition }}-windows
+          path: dist/windows/*
+          if-no-files-found: error
+          retention-days: 14
+
+  ios:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.build_ios == 'true' }}
+    needs: checks
+    runs-on: macos-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - edition: lvguojian
+            arguments: ''
+          - edition: zhenguojian
+            arguments: '--all-sources'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.4'
+          channel: stable
+          cache: true
+      - run: python3 scripts/build_ios.py ${{ matrix.arguments }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.edition }}-ios-unsigned
+          path: dist/ios/*
+          if-no-files-found: error
+          retention-days: 14
