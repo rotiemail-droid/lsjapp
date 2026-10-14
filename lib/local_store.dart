@@ -21,6 +21,15 @@ class LibraryChanges extends ChangeNotifier {
   void notify() => notifyListeners();
 }
 
+typedef _InterfaceSnapshot = ({
+  bool locked,
+  String themeMode,
+  String displayMode,
+  int profileEpoch,
+  String profileId,
+  String? configurationError,
+});
+
 class LocalStore extends ChangeNotifier {
   LocalStore(this.preferences, {LocalSnapshot? snapshot}) {
     _initialize(snapshot);
@@ -30,6 +39,9 @@ class LocalStore extends ChangeNotifier {
   LocalSnapshot? _snapshot;
   final LibraryChanges _libraryChanges = LibraryChanges();
   Listenable get libraryChanges => _libraryChanges;
+  final ChangeNotifier _interfaceChanges = ChangeNotifier();
+  _InterfaceSnapshot? _interfaceSnapshot;
+  Listenable get interfaceChanges => _interfaceChanges;
   LanDocument? _lanDocumentCache;
   int _lanRevision = 0;
   int _lanUrgentRevision = 0;
@@ -113,6 +125,22 @@ class LocalStore extends ChangeNotifier {
     if (_disposed) return;
     _libraryChanges.notify();
     notifyListeners();
+    _notifyInterface();
+  }
+
+  void _notifyInterface() {
+    if (_disposed) return;
+    final snapshot = (
+      locked: locked,
+      themeMode: themeMode,
+      displayMode: displayMode,
+      profileEpoch: profileEpoch,
+      profileId: _current,
+      configurationError: _configurationError,
+    );
+    if (snapshot == _interfaceSnapshot) return;
+    _interfaceSnapshot = snapshot;
+    _interfaceChanges.notifyListeners();
   }
 
   void _notifyLibrary() {
@@ -1349,6 +1377,7 @@ class LocalStore extends ChangeNotifier {
   void dispose() {
     _disposed = true;
     _snapshot?.encoder.dispose();
+    _interfaceChanges.dispose();
     super.dispose();
   }
 }

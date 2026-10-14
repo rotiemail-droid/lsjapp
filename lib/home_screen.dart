@@ -1841,14 +1841,11 @@ class _HomeScreenState extends State<HomeScreen> {
             child: GestureDetector(
               onHorizontalDragEnd: television ? null : _swipeCategory,
               child: items.isEmpty && (_loading || _viewCache.computing)
-                  ? const Center(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          CircularProgressIndicator(),
-                          SizedBox(height: 18),
-                          Text('正在加载剧集'),
-                        ],
+                  ? LayoutBuilder(
+                      builder: (context, constraints) => DramaSkeletonGrid(
+                        width: constraints.maxWidth,
+                        height: constraints.maxHeight,
+                        television: television,
                       ),
                     )
                   : _items.isEmpty && _error != null

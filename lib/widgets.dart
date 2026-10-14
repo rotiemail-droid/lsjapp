@@ -316,6 +316,15 @@ class _CachedCoverImageState extends State<CachedCoverImage> {
         fit: BoxFit.cover,
         cacheWidth: 440,
         excludeFromSemantics: true,
+        frameBuilder: (context, child, frame, wasSynchronouslyLoaded) =>
+            wasSynchronouslyLoaded
+            ? child
+            : AnimatedOpacity(
+                opacity: frame == null ? 0 : 1,
+                duration: const Duration(milliseconds: 180),
+                curve: Curves.easeOut,
+                child: child,
+              ),
         errorBuilder: (_, error, stack) => _failed(snapshot.data),
       );
     },
@@ -626,8 +635,11 @@ class StatusPanel extends StatelessWidget {
   );
 }
 
+int dramaGridColumns(double width) =>
+    width < 600 ? 3 : (width / 180).floor().clamp(4, 9);
+
 SliverGridDelegate dramaGridDelegate(BuildContext context, double width) {
-  final columns = width < 600 ? 3 : (width / 180).floor().clamp(4, 9);
+  final columns = dramaGridColumns(width);
   final spacing = width < 600 ? 10.0 : 18.0;
   final tileWidth = (width - (columns - 1) * spacing) / columns;
   return SliverGridDelegateWithFixedCrossAxisCount(
@@ -636,6 +648,150 @@ SliverGridDelegate dramaGridDelegate(BuildContext context, double width) {
     crossAxisSpacing: spacing,
     mainAxisExtent: DramaTile.extentFor(context, tileWidth),
   );
+}
+
+class DramaSkeletonGrid extends StatefulWidget {
+  const DramaSkeletonGrid({
+    super.key,
+    required this.width,
+    required this.height,
+    this.television = false,
+  });
+
+  final double width;
+  final double height;
+  final bool television;
+
+  @override
+  State<DramaSkeletonGrid> createState() => _DramaSkeletonGridState();
+}
+
+class _DramaSkeletonGridState extends State<DramaSkeletonGrid>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _shimmer = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1500),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _shimmer.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final padding = widget.television
+        ? 18.0
+        : widget.width < 600
+        ? 16.0
+        : 24.0;
+    final columns = widget.television
+        ? ((widget.width - 36) / 150).floor().clamp(1, 8)
+        : dramaGridColumns(widget.width - 2 * padding);
+    final spacing = widget.television
+        ? 14.0
+        : widget.width < 600
+        ? 10.0
+        : 18.0;
+    final tileWidth =
+        (widget.width - 2 * padding - (columns - 1) * spacing) / columns;
+    final extent = widget.television
+        ? DramaTile.extentFor(context, tileWidth - 14) + 14
+        : DramaTile.extentFor(context, tileWidth);
+    final rows = ((widget.height + spacing) / (extent + spacing)).ceil().clamp(
+      1,
+      6,
+    );
+    final count = rows * columns;
+    return ExcludeSemantics(
+      child: AnimatedBuilder(
+        animation: _shimmer,
+        builder: (context, _) => ShaderMask(
+          blendMode: BlendMode.srcATop,
+          shaderCallback: (bounds) =>
+              const LinearGradient(
+                colors: [
+                  Color(0x00FFFFFF),
+                  Color(0x59FFFFFF),
+                  Color(0x00FFFFFF),
+                ],
+                stops: [0, 0.12, 0.24],
+              ).createShader(
+                bounds.translate(
+                  bounds.width * (1.55 * _shimmer.value - 0.3),
+                  0,
+                ),
+              ),
+          child: GridView(
+            padding: EdgeInsets.fromLTRB(
+              padding,
+              widget.television ? 2 : 8,
+              padding,
+              16,
+            ),
+            physics: const NeverScrollableScrollPhysics(),
+            gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: columns,
+              mainAxisExtent: extent,
+              mainAxisSpacing: widget.television ? 14 : 22,
+              crossAxisSpacing: spacing,
+            ),
+            children: [
+              for (var index = 0; index < count; index++) const _SkeletonTile(),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SkeletonTile extends StatelessWidget {
+  const _SkeletonTile();
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        AspectRatio(
+          aspectRatio: 2 / 3,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: colors.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(14),
+            ),
+          ),
+        ),
+        const SizedBox(height: 9),
+        FractionallySizedBox(
+          alignment: Alignment.centerLeft,
+          widthFactor: .88,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: colors.surfaceContainerHigh,
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: const SizedBox(height: 13),
+          ),
+        ),
+        const SizedBox(height: 4),
+        FractionallySizedBox(
+          alignment: Alignment.centerLeft,
+          widthFactor: .55,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: colors.surfaceContainerHigh,
+              borderRadius: BorderRadius.circular(5),
+            ),
+            child: const SizedBox(height: 11),
+          ),
+        ),
+      ],
+    );
+  }
 }
 
 String formatPosition(double seconds) {

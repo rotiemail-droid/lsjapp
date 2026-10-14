@@ -248,7 +248,7 @@ class DuanjuApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => AnimatedBuilder(
-    animation: Listenable.merge([store]),
+    animation: Listenable.merge([store?.interfaceChanges]),
     builder: (_, _) => _application(),
   );
 
